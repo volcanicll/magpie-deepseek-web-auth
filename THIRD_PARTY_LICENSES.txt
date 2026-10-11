@@ -1,0 +1,20 @@
+Third-party assets bundled in this repository
+=============================================
+
+1. test/fixtures/pow_solver.wasm
+   Source: DeepSeek web client (https://chat.deepseek.com), the proof-of-work
+   solver module the page itself loads.
+   Copyright (c) DeepSeek. All rights reserved by the owner.
+   License: none provided by the source. This file is redistributed solely as
+   a test fixture, to verify that src/pow.mjs reproduces the vendor's own hash and
+   solver byte for byte. It is not required at runtime and is not executed by
+   the plugin.
+
+2. assets/deepseek-color.svg
+   Source: yetone/magpie (https://github.com/yetone/magpie),
+   internal/gui/assets/icons/deepseek-color.svg.
+   Copyright (c) 2026 yetone. Licensed under the MIT License
+   (https://github.com/yetone/magpie/blob/main/LICENSE).
+
+All other files in this repository are licensed under the MIT License in
+LICENSE.

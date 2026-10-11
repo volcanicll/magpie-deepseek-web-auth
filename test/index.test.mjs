@@ -2,10 +2,10 @@ import { test, expect, afterEach } from "bun:test"
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { server, _internal } from "../index.mjs"
-import { start, streamText } from "../fake.mjs"
+import { server, _internal } from "../src/index.mjs"
+import { start, streamText } from "./fake.mjs"
 
-const { PatchReader, messagesToPrompt, tokenFromLevelDb } = _internal
+const { PatchReader, messagesToPrompt, tokenFromLevelDb, extractAttachments } = _internal
 
 const running = []
 async function fake(options) {
@@ -72,7 +72,7 @@ test("a turn solves the PoW, creates a session and returns the reply", async () 
     model_type: "default",
     prompt: "hi",
     thinking_enabled: false,
-    search_enabled: false,
+    search_enabled: true,
     ref_file_ids: [],
     preempt: false,
   })
@@ -92,6 +92,17 @@ test("the reasoner model asks for the expert model type with thinking on", async
   expect(out.content).toBe("2+2=4")
   expect(f.seen.completions[0].payload.model_type).toBe("expert")
   expect(f.seen.completions[0].payload.thinking_enabled).toBe(true)
+  // web search is on for the reasoner too, as the page's toggle starts
+  expect(f.seen.completions[0].payload.search_enabled).toBe(true)
+})
+
+test("web search is on by default and the request body can turn it off", async () => {
+  const f = await fake({ reply: "ok" })
+  const { options } = await loaded(f)
+  await streamText(await chat(options, { model: "deepseek-chat", stream: true, messages: [{ role: "user", content: "hi" }] }))
+  expect(f.seen.completions[0].payload.search_enabled).toBe(true)
+  await streamText(await chat(options, { model: "deepseek-chat", stream: true, search_enabled: false, messages: [{ role: "user", content: "hi" }] }))
+  expect(f.seen.completions[1].payload.search_enabled).toBe(false)
 })
 
 test("the page's own headers travel with the request", async () => {
@@ -563,4 +574,359 @@ test("a real question that merely mentions titles is not a title request", async
   // a plain conversation turn: no throwaway chat, nothing deleted
   expect(f.seen.sessions).toEqual(["session-1"])
   expect(f.seen.deletions).toEqual([])
+})
+
+// ---------------------------------------------------------------------------
+// attachments: the page sends files ahead of the turn (its own PoW, the
+// x-thinking-enabled/x-model-type/x-file-size headers, then a parse poll) and
+// the turn references the uploaded id; a turn that carries files runs on
+// `default` with thinking off, which the web app's server insists on, while
+// web search stays as asked.
+// ---------------------------------------------------------------------------
+
+const pngDataUrl = `data:image/png;base64,${Buffer.from("png-bytes").toString("base64")}`
+
+test("an image attachment is uploaded with the page's upload headers and referenced", async () => {
+  const f = await fake({ reply: "a red square" })
+  const { options } = await loaded(f)
+  const out = await streamText(await chat(options, {
+    model: "deepseek-chat",
+    stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: pngDataUrl } }] }],
+  }))
+  expect(out.content).toBe("a red square")
+  // uploaded under its own proof of work and the page's three upload headers
+  expect(f.seen.uploads).toEqual([{
+    name: "image.png",
+    bytes: expect.any(Number),
+    pow: expect.any(String),
+    thinking: "0",
+    modelType: "default",
+    fileSize: expect.any(String),
+  }])
+  const decoded = JSON.parse(Buffer.from(f.seen.uploads[0].pow, "base64").toString("utf8"))
+  expect(decoded.algorithm).toBe("DeepSeekHashV1")
+  expect(decoded.target_path).toBe("/api/v0/file/upload_file")
+  // the upload is waited for parse, no fork on the way
+  expect(f.seen.forks).toEqual([])
+  expect(f.seen.fileStatusQueries).toEqual([["file-1"]])
+  // the turn references the upload and runs on default with thinking off,
+  // search as asked
+  expect(f.seen.completions[0].payload).toMatchObject({
+    model_type: "default",
+    ref_file_ids: ["file-1"],
+    thinking_enabled: false,
+    search_enabled: true,
+    prompt: "what is this?",
+  })
+})
+
+test("a text file attachment is uploaded and referenced the same way", async () => {
+  const f = await fake({ reply: "noted" })
+  const { options } = await loaded(f)
+  await streamText(await chat(options, {
+    model: "deepseek-chat",
+    stream: true,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "file", file: { filename: "notes.txt", file_data: `data:text/plain;base64,${Buffer.from("hello file").toString("base64")}` } },
+        { type: "text", text: "summarize" },
+      ],
+    }],
+  }))
+  expect(f.seen.uploads[0].name).toBe("notes.txt")
+  expect(f.seen.forks).toEqual([])
+  expect(f.seen.completions[0].payload).toMatchObject({
+    model_type: "default",
+    ref_file_ids: ["file-1"],
+    thinking_enabled: false,
+    search_enabled: true,
+  })
+})
+
+test("the reasoner's attachment turn runs on default with thinking off, search still on", async () => {
+  const f = await fake({ reply: "seen" })
+  const { options } = await loaded(f)
+  await streamText(await chat(options, {
+    model: "deepseek-reasoner",
+    stream: true,
+    messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: pngDataUrl } }, { type: "text", text: "look" }] }],
+  }))
+  expect(f.seen.completions[0].payload).toMatchObject({
+    model_type: "default",
+    ref_file_ids: ["file-1"],
+    thinking_enabled: false,
+    search_enabled: true,
+  })
+})
+
+test("an attachment DeepSeek cannot parse is dropped and noted in the prompt", async () => {
+  const f = await fake({ reply: "ok", fileStatus: "CONTENT_EMPTY" })
+  const { options } = await loaded(f)
+  await streamText(await chat(options, {
+    model: "deepseek-chat",
+    stream: true,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "file", file: { filename: "empty.txt", file_data: `data:text/plain;base64,${Buffer.from("empty").toString("base64")}` } },
+        { type: "text", text: "read this" },
+      ],
+    }],
+  }))
+  const sent = f.seen.completions[0]
+  // nothing to reference, so the turn is a plain one again
+  expect(sent.payload.ref_file_ids).toEqual([])
+  expect(sent.payload.model_type).toBe("default")
+  expect(sent.payload.search_enabled).toBe(true)
+  // and the prompt says the file was left out
+  expect(sent.payload.prompt).toContain("empty.txt")
+  expect(sent.payload.prompt).toContain("read this")
+})
+
+test("only the new turn's attachments are uploaded on a carried-on conversation", async () => {
+  const f = await fake({ reply: "answer" })
+  const hooks = await server({}, { origin: f.origin })
+  const options = await hooks.auth.loader(async () => ({ type: "api", key: "a-token" }))
+  const call = (messages) =>
+    options.fetch(new Request(`${options.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-magpie-session": "sess-att" },
+      body: JSON.stringify({ model: "deepseek-chat", stream: true, messages }),
+    })).then((r) => r.text())
+  await call([{ role: "user", content: "first" }])
+  await call([
+    { role: "user", content: "first" },
+    { role: "assistant", content: "answer" },
+    { role: "user", content: [{ type: "text", text: "second" }, { type: "image_url", image_url: { url: pngDataUrl } }] },
+  ])
+  // one chat, one upload: the first turn carried no files, the second carries one
+  expect(f.seen.sessions).toEqual(["session-1"])
+  expect(f.seen.uploads.length).toBe(1)
+  const completions = f.seen.completions.filter((c) => c.path === "/api/v0/chat/completion")
+  expect(completions[1].payload.prompt).toBe("second")
+  expect(completions[1].payload.ref_file_ids).toEqual(["file-1"])
+})
+
+test("a searched turn folds the page's SEARCH fragments into reasoning", async () => {
+  const f = await fake({ reply: "answer", searchFragment: "searching the web" })
+  const { options } = await loaded(f)
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, messages: [{ role: "user", content: "hi" }] }), { reasoning: true })
+  expect(out.content).toBe("answer")
+  expect(out.thoughts).toBe("searching the web")
+})
+
+test("extractAttachments reads image and file parts and skips the turns already sent", async () => {
+  const jpegUrl = `data:image/jpeg;base64,${Buffer.from("jpg").toString("base64")}`
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "old" }, { type: "image_url", image_url: { url: jpegUrl } }] },
+    { role: "assistant", content: "reply" },
+    { role: "user", content: [{ type: "file", file: { filename: "a.pdf", file_data: "JVBERi0=" } }, { type: "text", text: "new" }] },
+  ]
+  // from the second turn on: the assistant turn is skipped, the file part stays
+  expect(await extractAttachments(messages, 1)).toEqual([
+    { kind: "file", mime: "application/octet-stream", filename: "a.pdf", data: expect.any(Buffer) },
+  ])
+  const whole = await extractAttachments(messages, 0)
+  expect(whole.map((a) => a.kind)).toEqual(["image", "file"])
+  expect(whole[0]).toMatchObject({ kind: "image", mime: "image/jpeg", filename: null })
+  // plain text turns carry nothing
+  expect(await extractAttachments([{ role: "user", content: "just words" }])).toEqual([])
+})
+
+// ---------------------------------------------------------------------------
+// DSML: the web models write their built-in agent tools in <｜｜DSML｜｜…> markup,
+// which the page renders as tool UI. The reader folds it into the reasoning so
+// a reply never shows raw markup, however the stream splits the tags.
+// ---------------------------------------------------------------------------
+
+test("PatchReader moves DSML tool-call markup out of the reply", () => {
+  const reader = new PatchReader()
+  reader.apply({ v: { response: { status: "WIP", fragments: [{ type: "RESPONSE", content: "Let me check. " }] } } })
+  reader.apply({ p: "response/fragments/-1/content", o: "APPEND", v: '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="exec_command">' })
+  reader.apply({ p: "response/fragments/-1/content", o: "APPEND", v: '<｜｜DSML｜｜ parameter name="cmd" string="true">ls -la "a > b"</｜｜DSML｜｜ parameter>' })
+  reader.apply({ v: "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>" })
+  reader.apply({ v: "It is a Pages document." })
+  expect(reader.text).toBe("Let me check. It is a Pages document.")
+  expect(reader.reasoning).toContain("exec_command")
+  expect(reader.reasoning).toContain("ls -la")
+  expect(reader.text).not.toContain("DSML")
+})
+
+test("PatchReader keeps DSML out of the reply however the stream splits the tags", () => {
+  const whole = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="exec_command"><｜｜DSML｜｜ parameter name="cmd" string="true">ls</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>done'
+  // one character at a time, as a slow stream would
+  const reader = new PatchReader()
+  for (const ch of whole) reader.apply({ v: ch })
+  reader.flushHold()
+  expect(reader.text).toBe("done")
+  expect(reader.reasoning).toContain("exec_command")
+  // and a tag cut in half between deltas too
+  const at = whole.indexOf("calls>")
+  const reader2 = new PatchReader()
+  reader2.apply({ v: whole.slice(0, at) })
+  reader2.apply({ v: whole.slice(at) })
+  reader2.flushHold()
+  expect(reader2.text).toBe("done")
+})
+
+test("PatchReader leaves ordinary angle brackets and a stray tail alone", () => {
+  const reader = new PatchReader()
+  reader.apply({ v: "compare <a> with <b> and 1<2" })
+  reader.apply({ v: "<" })
+  reader.flushHold()
+  expect(reader.text).toBe("compare <a> with <b> and 1<2<")
+  // an unterminated block stays out of the reply, and its held tail lands in
+  // the reasoning when the stream ends
+  const open = new PatchReader()
+  open.apply({ v: "before <｜｜DSML｜｜ calls> trying tools" })
+  open.flushHold()
+  expect(open.text).toBe("before ")
+  expect(open.reasoning).toContain("trying tools")
+})
+
+// ---------------------------------------------------------------------------
+// tool calling: the client's tools ride the prompt as a protocol — the prompt
+// teaches the model the <tool_call> shape, and the reply's blocks are parsed
+// back into OpenAI tool_calls with finish_reason "tool_calls".
+// ---------------------------------------------------------------------------
+
+const weatherTool = {
+  type: "function",
+  function: { name: "get_weather", description: "Weather for a city", parameters: { type: "object", properties: { city: { type: "string" } } } },
+}
+
+test("models declare tool calling", async () => {
+  const f = await fake()
+  const { config } = await loaded(f)
+  const provider = config.provider["deepseek-web"]
+  expect(provider.models["deepseek-chat"].tool_call).toBe(true)
+  expect(provider.models["deepseek-reasoner"].tool_call).toBe(true)
+})
+
+test("a turn with tools opens the prompt with the protocol and parses the reply's calls", async () => {
+  const f = await fake({ reply: 'Let me check.\n<tool_call>{"name":"get_weather","arguments":{"city":"北京"}}</tool_call>' })
+  const { options } = await loaded(f)
+  const out = await streamText(await chat(options, {
+    model: "deepseek-chat",
+    stream: true,
+    tools: [weatherTool],
+    messages: [{ role: "user", content: "weather in 北京?" }],
+  }))
+  // the call is not reply text: the text stops before the block, the call
+  // arrives as tool_calls, and the turn finishes as one
+  expect(out.content).toBe("Let me check.\n")
+  expect(out.finish).toBe("tool_calls")
+  expect(out.calls).toEqual([
+    { index: 0, id: expect.any(String), type: "function", function: { name: "get_weather", arguments: '{"city":"北京"}' } },
+  ])
+  // the prompt taught the model the protocol and listed the tool
+  const sent = f.seen.completions[0].payload
+  expect(sent.prompt).toContain("[Tool calling]")
+  expect(sent.prompt).toContain('<tool_call>{"name":"tool name","arguments":{}}</tool_call>')
+  expect(sent.prompt).toContain('"get_weather"')
+  expect(sent.prompt).toContain("weather in 北京?")
+})
+
+test("several calls parse in one reply and the text between them flows", async () => {
+  const f = await fake({ reply: '<tool_call>{"name":"a","arguments":{}}</tool_call>mid text<tool_call>{"name":"b","arguments":{"x":1}}</tool_call>' })
+  const { options } = await loaded(f)
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }))
+  expect(out.content).toBe("mid text")
+  expect(out.finish).toBe("tool_calls")
+  expect(out.calls.map((c) => c.function.name)).toEqual(["a", "b"])
+  expect(out.calls.map((c) => c.index)).toEqual([0, 1])
+})
+
+test("DSML blocks stay in the reasoning even when the turn carries tools", async () => {
+  const f = await fake({ reply: '<｜｜DSML｜｜ calls>searching</｜｜DSML｜｜ calls><tool_call>{"name":"a","arguments":null}</tool_call>' })
+  const { options } = await loaded(f)
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }), { reasoning: true })
+  expect(out.content).toBe("")
+  expect(out.finish).toBe("tool_calls")
+  expect(out.calls).toEqual([{ index: 0, id: expect.any(String), type: "function", function: { name: "a", arguments: "{}" } }])
+  expect(out.thoughts).toContain("searching")
+})
+
+test("a fenced tool call still parses; a broken one never reaches the reply", async () => {
+  const f = await fake({ reply: '```json\n<tool_call>{"name":"a","arguments":{}}</tool_call>\n```' })
+  const { options } = await loaded(f)
+  // the model fenced the block against instructions: the fence leaks as text
+  // around it, but the call itself still parses
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }), { reasoning: true })
+  expect(out.finish).toBe("tool_calls")
+  expect(out.calls).toEqual([{ index: 0, id: expect.any(String), type: "function", function: { name: "a", arguments: "{}" } }])
+  // a block that does not parse goes to the reasoning, never the reply
+  const broken = new PatchReader({ tools: true })
+  broken.apply({ v: "<tool_call>not json at all</tool_call>" })
+  broken.flushHold()
+  expect(broken.text).toBe("")
+  expect(broken.toolCalls).toEqual([])
+  expect(broken.reasoning).toContain("not json at all")
+})
+
+test("tool blocks split across stream frames still parse", () => {
+  const { PatchReader } = _internal
+  const whole = 'answer <tool_call>{"name":"a","arguments":{"x":1}}</tool_call> tail'
+  const reader = new PatchReader({ tools: true })
+  for (const ch of whole) reader.apply({ v: ch })
+  reader.flushHold()
+  expect(reader.text).toBe("answer  tail")
+  expect(reader.toolCalls).toEqual([{ id: expect.any(String), name: "a", arguments: '{"x":1}' }])
+  // a block cut off by the stream's end is unexecutable: it goes to the
+  // reasoning, never to the reply or the tool_calls
+  const open = new PatchReader({ tools: true })
+  open.apply({ v: 'before <tool_call>{"name":"a"' })
+  open.flushHold()
+  expect(open.text).toBe("before ")
+  expect(open.toolCalls).toEqual([])
+  expect(open.reasoning).toContain('"name":"a"')
+})
+
+test("a reply without tool calls finishes as a plain stop", async () => {
+  const f = await fake({ reply: "plain answer" })
+  const { options } = await loaded(f)
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }))
+  expect(out.content).toBe("plain answer")
+  expect(out.finish).toBe("stop")
+  expect(out.calls).toEqual([])
+})
+
+test("tool_choice none and title requests take no protocol", async () => {
+  const f = await fake({ reply: "ok" })
+  const { options } = await loaded(f)
+  await streamText(await chat(options, { model: "deepseek-chat", stream: true, tool_choice: "none", tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }))
+  expect(f.seen.completions[0].payload.prompt).not.toContain("[Tool calling]")
+  await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: titleRequest("你会做什么") }))
+  const title = f.seen.completions[1].payload
+  expect(title.prompt).not.toContain("[Tool calling]")
+})
+
+test("a non-streaming answer carries tool_calls on the message", async () => {
+  const f = await fake({ reply: '<tool_call>{"name":"a","arguments":{}}</tool_call>' })
+  const { options } = await loaded(f)
+  const body = await chat(options, { model: "deepseek-chat", stream: false, tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }).then((r) => r.json())
+  expect(body.choices[0].finish_reason).toBe("tool_calls")
+  expect(body.choices[0].message.tool_calls).toEqual([
+    { index: 0, id: expect.any(String), type: "function", function: { name: "a", arguments: "{}" } },
+  ])
+})
+
+test("history shows the model its own calls and their results", () => {
+  const { messagesToPrompt } = _internal
+  const prompt = messagesToPrompt(
+    [
+      { role: "user", content: "weather?" },
+      { role: "assistant", tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"北京"}' } }] },
+      { role: "tool", tool_call_id: "call_1", content: "sunny 25C" },
+      { role: "user", content: "and tomorrow?" },
+    ],
+    0,
+    { tools: [weatherTool] },
+  )
+  expect(prompt).toContain('<tool_call>{"name":"get_weather","arguments":{"city":"北京"}}</tool_call>')
+  expect(prompt).toContain("Tool result (get_weather): sunny 25C")
+  expect(prompt).toContain("User: and tomorrow?")
+  expect(prompt).toContain("[Tool calling]")
 })

@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url"
 
 const problems = []
 try {
-  const mod = await import(new URL("../index.mjs", import.meta.url).href)
+  const mod = await import(new URL("../src/index.mjs", import.meta.url).href)
   const fns = Object.values(mod).filter((value) => typeof value === "function")
   if (!fns.length) problems.push("exports no plugin function")
   const client = {

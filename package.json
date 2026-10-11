@@ -3,22 +3,20 @@
   "version": "0.1.0",
   "description": "DeepSeek (chat.deepseek.com) for Magpie — the unofficial plugin: the account already signed in to the web app, its own proof of work and chat stream, one DeepSeek chat per agent conversation",
   "type": "module",
-  "main": "./index.mjs",
+  "main": "./src/index.mjs",
   "exports": {
-    ".": "./index.mjs",
-    "./server": "./index.mjs",
-    "./pow": "./pow.mjs"
+    ".": "./src/index.mjs",
+    "./server": "./src/index.mjs",
+    "./pow": "./src/pow.mjs"
   },
   "files": [
-    "index.mjs",
-    "pow.mjs",
-    "pow_solver.wasm",
-    "fake.mjs",
-    "tests",
+    "src",
+    "test",
     "scripts",
     "assets",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.txt"
   ],
   "keywords": [
     "magpie",

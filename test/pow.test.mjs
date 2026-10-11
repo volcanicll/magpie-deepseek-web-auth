@@ -2,7 +2,7 @@ import { test, expect } from "bun:test"
 import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { sha3Digest, deepSeekHashV1, solvePow, powHeader, powPrefix, MAX_DIFFICULTY } from "../pow.mjs"
+import { sha3Digest, deepSeekHashV1, solvePow, powHeader, powPrefix, MAX_DIFFICULTY } from "../src/pow.mjs"
 
 // SHA3-256 with all 24 rounds is FIPS 202's own digest, so node:crypto can pin
 // the permutation, padding and multi-block absorption — the parts a
@@ -26,7 +26,7 @@ const WASM_DIGESTS = [
   ["x".repeat(300), "31e036e2f0c5e1761b18fba0c2907cc7abf9b40a58cf015e69704e3deb87fc96"],
 ]
 
-const wasmPath = join(import.meta.dir, "..", "pow_solver.wasm")
+const wasmPath = join(import.meta.dir, "fixtures", "pow_solver.wasm")
 const haveWasm = (() => {
   try {
     readFileSync(wasmPath)

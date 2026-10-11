@@ -1,7 +1,7 @@
 // A fake chat.deepseek.com: the endpoints and the SSE patch stream the plugin
 // talks to, so its fetch is exercised without an account.
 import { createServer } from "node:http"
-import { deepSeekHashV1, powPrefix } from "./pow.mjs"
+import { deepSeekHashV1, powPrefix } from "../src/pow.mjs"
 
 export const DIFFICULTY = 32
 
@@ -33,21 +33,49 @@ async function body(req) {
 }
 
 // start brings up the fake and returns what to point the plugin's host at.
-export async function start({ reply = "Hello", thinking = "", status = "FINISHED", fragmentType = "RESPONSE", usage = 12 } = {}) {
-  const seen = { challenges: [], sessions: [], completions: [], headers: [], deletions: [] }
+export async function start({ reply = "Hello", thinking = "", status = "FINISHED", fragmentType = "RESPONSE", usage = 12, fileStatus = "SUCCESS", searchFragment = "" } = {}) {
+  const seen = { challenges: [], sessions: [], completions: [], headers: [], deletions: [], uploads: [], forks: [], fileStatusQueries: [] }
   let saltCounter = 0
+  let fileCounter = 0
+  let forkCounter = 0
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1")
     seen.headers.push({ path: url.pathname, headers: req.headers })
     if (url.pathname === "/api/v0/chat/create_pow_challenge") {
       const { target_path } = await body(req)
       seen.challenges.push({ targetPath: target_path })
-      // DeepSeek only issues a challenge for the completion path.
-      if (target_path !== "/api/v0/chat/completion") {
+      // DeepSeek only issues a challenge for its two scenes: the completion
+      // and the file upload.
+      if (target_path !== "/api/v0/chat/completion" && target_path !== "/api/v0/file/upload_file") {
         return json(res, { code: 0, msg: "", data: { biz_code: 1, biz_msg: "INVALID_TARGET_PATH", biz_data: null } })
       }
       const challenge = makeChallenge(`salt${saltCounter++}`, 1791638192759)
       return json(res, envelope({ challenge: { ...challenge, target_path } }))
+    }
+    if (url.pathname === "/api/v0/file/upload_file") {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const raw = Buffer.concat(chunks).toString("utf8")
+      const name = raw.match(/filename="([^"]*)"/)?.[1] ?? null
+      seen.uploads.push({
+        name,
+        bytes: Buffer.byteLength(raw),
+        pow: req.headers["x-ds-pow-response"],
+        thinking: req.headers["x-thinking-enabled"],
+        modelType: req.headers["x-model-type"],
+        fileSize: req.headers["x-file-size"],
+      })
+      return json(res, envelope({ id: `file-${++fileCounter}`, file_name: name, file_size: Buffer.byteLength(raw), status: "PENDING", model_kind: "VISION" }))
+    }
+    if (url.pathname === "/api/v0/file/fork_file_task") {
+      const { file_id, to_model_type } = await body(req)
+      seen.forks.push({ fileId: file_id, toModelType: to_model_type })
+      return json(res, envelope({ id: `forked-${++forkCounter}`, file_id, to_model_type }))
+    }
+    if (url.pathname === "/api/v0/file/fetch_files") {
+      const ids = url.searchParams.getAll("file_ids")
+      seen.fileStatusQueries.push(ids)
+      return json(res, envelope({ files: ids.map((id) => ({ id, status: fileStatus })) }))
     }
     if (url.pathname === "/api/v0/chat_session/delete") {
       const { chat_session_id } = await body(req)
@@ -75,6 +103,9 @@ export async function start({ reply = "Hello", thinking = "", status = "FINISHED
       const continuing = url.pathname === "/api/v0/chat/continue"
       // A turn that will stop unfinished has only its opening text so far; the
       // continuation carries the rest.
+      if (payload.search_enabled && searchFragment && !continuing) {
+        res.write(`data: ${JSON.stringify({ v: { response: { message_id: 2, status: "WIP", fragments: [{ id: 1, type: "SEARCH", content: searchFragment, status: "WIP" }] } } })}\n\n`)
+      }
       if (!continuing) {
         res.write(`data: ${JSON.stringify({ v: { response: { message_id: 2, status: "WIP", thinking_enabled: false, accumulated_token_usage: 0, fragments: [{ id: 2, type: fragmentType, content: reply.slice(0, 1) }] } } })}\n\n`)
         if (thinking) res.write(`data: ${JSON.stringify({ p: "response/fragments/-1", o: "APPEND", v: thinking })}\n\n`)
@@ -103,6 +134,7 @@ export async function streamText(response, { reasoning = false } = {}) {
   let thoughts = ""
   let finish = null
   let usage = null
+  const calls = []
   for (const line of text.split("\n")) {
     if (!line.startsWith("data: ")) continue
     const payload = line.slice(6)
@@ -113,9 +145,11 @@ export async function streamText(response, { reasoning = false } = {}) {
     if (choice) {
       content += choice.delta?.content ?? ""
       thoughts += choice.delta?.reasoning_content ?? ""
+      for (const call of choice.delta?.tool_calls ?? []) calls.push(call)
       if (choice.finish_reason) finish = choice.finish_reason
     }
     if (frame.usage) usage = frame.usage
   }
-  return reasoning ? { content, thoughts, finish, usage, raw: text } : { content, finish, usage, raw: text }
+  const out = { content, finish, usage, calls, raw: text }
+  return reasoning ? { ...out, thoughts } : out
 }
