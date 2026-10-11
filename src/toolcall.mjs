@@ -37,6 +37,7 @@ function toolsToPrompt(tools) {
     '- "arguments" carries the tool\'s parameters as JSON, following its schema.',
     "You may output several <tool_call> blocks in one reply to call tools in parallel.",
     "Do not wrap a call in code fences, and write nothing after the calls: their results arrive with the next turn.",
+    "Use exactly this markup — never the DSML/内部工具 format, never any other tag style.",
     "When no tool fits, answer normally and call nothing.",
     "The tools:",
     ...list,
@@ -74,4 +75,53 @@ function parseToolCall(inner) {
   }
 }
 
-export { TOOL_CALL_OPEN, TOOL_CALL_SHUT, TOOL_RUNAWAY, toolsToPrompt, renderToolCall, parseToolCall }
+// The web models also write tool calls in their own DSML markup — the page's
+// built-in agent format — whenever the conversation feels agent-like:
+//
+//   <｜｜DSML｜｜ calls>
+//   <｜｜DSML｜｜ invoke name="exec_command">
+//   <｜｜DSML｜｜ parameter name="cmd" string="true">ls -la</｜｜DSML｜｜ parameter>
+//   </｜｜DSML｜｜ invoke>
+//   </｜｜DSML｜｜ calls>
+//
+// With tools on the turn those are calls the agent can run, so they parse
+// into tool_calls like <tool_call> blocks do; the delimiters are matched
+// loosely, tolerating the fullwidth and pipe variations seen in the wild.
+const DSML_INVOKE = /<[｜|\s]*DSML[｜|\s]*invoke\b([^>]*)>([\s\S]*?)<[｜|\s]*\/[｜|\s]*DSML[｜|\s]*invoke[^>]*>/g
+const DSML_PARAMETER = /<[｜|\s]*DSML[｜|\s]*parameter\b([^>]*)>([\s\S]*?)<[｜|\s]*\/[｜|\s]*DSML[｜|\s]*parameter[^>]*>/g
+
+function tagName(attrs) {
+  const name = String(attrs ?? "").match(/name\s*=\s*"([^"]*)"/)
+  return name?.[1] ?? null
+}
+
+// parseDsmlCalls reads one DSML block into the tool calls it carries: an
+// invoke's name is the tool, its parameters the arguments (JSON values when
+// they parse, strings otherwise). A block with no readable invoke comes back
+// empty and the caller keeps the raw text visible in the reasoning.
+function parseDsmlCalls(block) {
+  const calls = []
+  for (const match of block.matchAll(DSML_INVOKE)) {
+    const name = tagName(match[1])
+    if (!name) continue
+    const args = {}
+    for (const parameter of match[2].matchAll(DSML_PARAMETER)) {
+      const key = tagName(parameter[1])
+      if (!key) continue
+      const raw = parameter[2]
+      try {
+        args[key] = JSON.parse(raw)
+      } catch {
+        args[key] = raw
+      }
+    }
+    calls.push({
+      id: `call_${Math.random().toString(36).slice(2, 12)}`,
+      name,
+      arguments: JSON.stringify(args),
+    })
+  }
+  return calls
+}
+
+export { TOOL_CALL_OPEN, TOOL_CALL_SHUT, TOOL_RUNAWAY, toolsToPrompt, renderToolCall, parseToolCall, parseDsmlCalls }

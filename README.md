@@ -104,7 +104,7 @@ magpie plugin add github:volcanicll/magpie-deepseek-web-auth
 
 - 声明了 `tools` 的请求，其提示词会先注入一段调用协议，教模型用 `<tool_call>{"name":"…","arguments":{…}}</tool_call>` 的形状发起调用；
 - 回复里的 `<tool_call>` 块被解析为 OpenAI `tool_calls`（每个调用一条完整 delta），该轮以 `finish_reason: "tool_calls"` 结束；下一轮的工具结果按 `Tool result (name): …` 回填进提示词；
-- 协议外的标记不会混进正文：网页模型自带的 DSML 标记（以及解析失败的调用块）一律折入 `reasoning_content`；
+- **双格式兼容**：模型既可能按协议输出 `<tool_call>`，也可能在 agent 语境下输出它原生的 DSML 标记（`<｜｜DSML｜｜ invoke …>`）——两者都会被解析为 `tool_calls`；解析失败的块折入 `reasoning_content`，永不混进正文；
 - 代价在模型侧：调用质量取决于模型对协议的遵守程度；`tool_choice: "none"` 或无 `tools` 的请求完全不走这套机制。
 
 ## 限制

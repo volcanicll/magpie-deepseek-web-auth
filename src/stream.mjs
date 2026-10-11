@@ -8,7 +8,7 @@
 // the reply's status in it — INCOMPLETE means DeepSeek stopped early and the
 // page asks it to continue.
 
-import { TOOL_CALL_OPEN, TOOL_CALL_SHUT, TOOL_RUNAWAY, parseToolCall } from "./toolcall.mjs"
+import { TOOL_CALL_OPEN, TOOL_CALL_SHUT, TOOL_RUNAWAY, parseToolCall, parseDsmlCalls } from "./toolcall.mjs"
 
 // The DSML tool-call markup the web models write for their built-in agent
 // tools, as the page's own client renders it: tags open with <｜｜DSML and
@@ -40,19 +40,20 @@ class PatchReader {
     this.usage = null
     this.lastKind = "RESPONSE" // what a patch to fragment -1 (the last one) belongs to
     // Two kinds of markup ride the reply's text channel and never belong in
-    // it. The web models write their built-in agent tools in DSML markup,
-    // which the page renders as tool UI; those blocks fold into the reasoning.
-    // And when the client gave the turn tools, the prompt-side protocol has
-    // the model write <tool_call> blocks, which are parsed into toolCalls —
-    // OpenAI `tool_calls`, not reply text. A marker a delta cut in half is
+    // it. The web models write tool calls in their own DSML markup — the
+    // page's built-in agent format — and with tools on the turn those calls
+    // are parsed into toolCalls (without tools they fold into the reasoning,
+    // since there is nothing to execute them). The prompt-side protocol's
+    // <tool_call> blocks parse the same way. A marker a delta cut in half is
     // held back until the rest of it arrives.
     this.tools = tools
     this.toolCalls = []
-    this.block = null // null | "dsml" | "tool"
+    this.block = null // null | "dsml" | "dsmltool" | "tool"
     this.mid = false // a DSML tag marker sits half-arrived at the hold
     this.hold = ""
     this.dsmlDepth = 0
     this.dsmlSeen = 0
+    this.dsmlBuf = ""
     this.toolBuf = ""
   }
 
@@ -192,6 +193,51 @@ class PatchReader {
         this.mid = true
         continue
       }
+      if (this.block === "dsmltool") {
+        // with tools on, a DSML block is a tool call in the model's own
+        // format: capture it whole, then parse the invokes out of it
+        if (this.mid) {
+          const end = buffer.indexOf(">")
+          if (end === -1) {
+            this.hold = buffer
+            return
+          }
+          const tag = buffer.slice(0, end + 1)
+          this.dsmlBuf += tag
+          buffer = buffer.slice(end + 1)
+          this.mid = false
+          this.dsmlDepth += tag.startsWith(DSML_SHUT) ? -1 : 1
+          if (this.dsmlDepth <= 0) {
+            this.block = null
+            const raw = this.dsmlBuf
+            this.dsmlBuf = ""
+            const calls = parseDsmlCalls(raw)
+            if (calls.length) for (const call of calls) this.toolCalls.push(call)
+            // nothing readable in it: back to the reasoning, never the reply
+            else this.reasoning += raw
+          }
+          continue
+        }
+        const open = buffer.indexOf(DSML_OPEN)
+        const shut = buffer.indexOf(DSML_SHUT)
+        const at = shut === -1 ? open : open === -1 ? shut : Math.min(open, shut)
+        if (at === -1) {
+          const keep = tailHold(buffer, [DSML_OPEN, DSML_SHUT])
+          if (keep) {
+            this.dsmlBuf += buffer.slice(0, buffer.length - keep)
+            this.hold = buffer.slice(buffer.length - keep)
+          } else {
+            this.dsmlBuf += buffer
+          }
+          return
+        }
+        if (at > 0) {
+          this.dsmlBuf += buffer.slice(0, at)
+          buffer = buffer.slice(at)
+        }
+        this.mid = true
+        continue
+      }
       if (this.block === "tool") {
         // the whole block is held until its closing tag: accumulate first,
         // then search — a tag split across deltas spans buffer and toolBuf
@@ -219,9 +265,12 @@ class PatchReader {
         else this.reasoning += `${TOOL_CALL_OPEN}${inner}${TOOL_CALL_SHUT}`
         continue
       }
-      // plain text: find the earliest open marker
+      // plain text: find the earliest open marker. <tool_call> blocks are
+      // unambiguous call intents and always parse; a DSML block is only a
+      // tool call when the turn actually carries tools, and otherwise the
+      // model's own business, kept in the reasoning.
       const dsmlAt = buffer.indexOf(DSML_OPEN)
-      const toolAt = this.tools ? buffer.indexOf(TOOL_CALL_OPEN) : -1
+      const toolAt = buffer.indexOf(TOOL_CALL_OPEN)
       const at = toolAt === -1 ? dsmlAt : dsmlAt === -1 ? toolAt : Math.min(dsmlAt, toolAt)
       if (at === -1) {
         const keep = tailHold(buffer, this.markers)
@@ -240,9 +289,12 @@ class PatchReader {
         buffer = buffer.slice(TOOL_CALL_OPEN.length)
         continue
       }
-      // the opening tag itself is counted when it completes, below
-      this.block = "dsml"
+      // the opening tag itself is counted when it completes, below — and with
+      // tools on the turn a DSML block is a tool call, not reasoning
+      this.block = this.tools ? "dsmltool" : "dsml"
+      this.dsmlDepth = 0
       this.dsmlSeen = 0
+      this.dsmlBuf = ""
       this.mid = true
     }
   }
@@ -255,6 +307,14 @@ class PatchReader {
     if (this.block === "tool" && this.toolBuf) {
       this.reasoning += `${TOOL_CALL_OPEN}${this.toolBuf}`
       this.toolBuf = ""
+      this.block = null
+    }
+    if (this.block === "dsmltool" && (this.dsmlBuf || this.hold)) {
+      // the remains of an unterminated DSML block: unexecutable markup, so
+      // the reasoning keeps it visible and the reply stays clean
+      this.reasoning += `${this.dsmlBuf}${this.hold}`
+      this.dsmlBuf = ""
+      this.hold = ""
       this.block = null
     }
     if (!this.hold) return

@@ -1,6 +1,6 @@
 {
   "name": "magpie-deepseek-web-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek (chat.deepseek.com) for Magpie — the unofficial plugin: the account already signed in to the web app, its own proof of work and chat stream, one DeepSeek chat per agent conversation",
   "type": "module",
   "main": "./src/index.mjs",

@@ -839,14 +839,53 @@ test("several calls parse in one reply and the text between them flows", async (
   expect(out.calls.map((c) => c.index)).toEqual([0, 1])
 })
 
-test("DSML blocks stay in the reasoning even when the turn carries tools", async () => {
-  const f = await fake({ reply: '<｜｜DSML｜｜ calls>searching</｜｜DSML｜｜ calls><tool_call>{"name":"a","arguments":null}</tool_call>' })
+test("a DSML block with tools on parses into tool_calls — the model's own agent format", async () => {
+  // the shape live streams carry when the model reaches for its built-in
+  // agent tools instead of the prompt protocol
+  const dsml = [
+    "<｜｜DSML｜｜ calls>",
+    '<｜｜DSML｜｜ invoke name="exec_command">',
+    '<｜｜DSML｜｜ parameter name="cmd" string="true">ls -la "/tmp"</｜｜DSML｜｜ parameter>',
+    "</｜｜DSML｜｜ invoke>",
+    "</｜｜DSML｜｜ calls>",
+  ].join("")
+  const f = await fake({ reply: `${dsml}doing it now` })
   const { options } = await loaded(f)
-  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: [{ role: "user", content: "hi" }] }), { reasoning: true })
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, tools: [weatherTool], messages: [{ role: "user", content: "list /tmp" }] }))
+  expect(out.content).toBe("doing it now")
+  expect(out.finish).toBe("tool_calls")
+  expect(out.calls).toEqual([
+    { index: 0, id: expect.any(String), type: "function", function: { name: "exec_command", arguments: '{"cmd":"ls -la \\"/tmp\\""}' } },
+  ])
+})
+
+test("a DSML block without tools stays in the reasoning; a protocol block still parses", async () => {
+  const f = await fake({ reply: "<｜｜DSML｜｜ calls>searching</｜｜DSML｜｜ calls><tool_call>{\"name\":\"a\",\"arguments\":null}</tool_call>" })
+  const { options } = await loaded(f)
+  // no tools on the turn: DSML is the model's own business and stays in the
+  // reasoning, but a <tool_call> block is an unambiguous call intent
+  const out = await streamText(await chat(options, { model: "deepseek-chat", stream: true, messages: [{ role: "user", content: "hi" }] }), { reasoning: true })
   expect(out.content).toBe("")
   expect(out.finish).toBe("tool_calls")
   expect(out.calls).toEqual([{ index: 0, id: expect.any(String), type: "function", function: { name: "a", arguments: "{}" } }])
   expect(out.thoughts).toContain("searching")
+})
+
+test("a DSML block split across frames parses, a DSML block with no invoke does not", async () => {
+  const { PatchReader } = _internal
+  const whole = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="web_search"><｜｜DSML｜｜ parameter name="q" string="true">magpie</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>ok'
+  const reader = new PatchReader({ tools: true })
+  for (const ch of whole) reader.apply({ v: ch })
+  reader.flushHold()
+  expect(reader.text).toBe("ok")
+  expect(reader.toolCalls).toEqual([{ id: expect.any(String), name: "web_search", arguments: '{"q":"magpie"}' }])
+  // no readable invoke inside: the raw block stays visible in the reasoning
+  const empty = new PatchReader({ tools: true })
+  empty.apply({ v: "<｜｜DSML｜｜ calls>just noise</｜｜DSML｜｜ calls>" })
+  empty.flushHold()
+  expect(empty.text).toBe("")
+  expect(empty.toolCalls).toEqual([])
+  expect(empty.reasoning).toContain("just noise")
 })
 
 test("a fenced tool call still parses; a broken one never reaches the reply", async () => {
