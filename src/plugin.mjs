@@ -16,7 +16,7 @@ import {
 } from "./config.mjs"
 import { whoAmI, findBrowserToken, findLiveBrowserToken } from "./browser-token.mjs"
 import { deleteSession, isTitleRequest } from "./api.mjs"
-import { encoder, chunk, finishReason, messagesToPrompt } from "./openai.mjs"
+import { encoder, chunk, finishReason, messagesToPrompt, messageSignature } from "./openai.mjs"
 import { extractAttachments, prepareFiles } from "./attachments.mjs"
 import { runTurn } from "./turn.mjs"
 
@@ -199,12 +199,37 @@ export const server = async (_input, _options) => {
             let from = 0
             let deepseekSession = null
             let parentMessageId = null
-            if (!titleRequest && known && known.sessionId && Date.now() - (known.at ?? 0) <= SESSION_TTL && known.count > 0 && known.count < messages.length) {
-              deepseekSession = known.sessionId
-              parentMessageId = known.messageId
-              from = known.count
+            if (!titleRequest && known?.sessionId && Date.now() - (known.at ?? 0) <= SESSION_TTL) {
+              // Where the conversation we already sent carries on: the anchor
+              // is the last message of the previous request, found again in
+              // this one. A history that grew — the usual tool loop, the
+              // model's call and the client's result — continues the same
+              // DeepSeek chat with only the new turns. A history the agent
+              // rewrote (compaction, pruned results) that no longer holds the
+              // anchor, or one identical to what was already answered, starts
+              // a fresh chat with the whole labelled story.
+              let found = -1
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if (messageSignature(messages[i]) === known.anchor) {
+                  found = i
+                  break
+                }
+              }
+              if (found !== -1 && found + 1 < messages.length) {
+                deepseekSession = known.sessionId
+                parentMessageId = known.messageId
+                from = found + 1
+              }
             }
-            const prompt = messagesToPrompt(messages, from, { tools })
+            let prompt = messagesToPrompt(messages, from, { tools })
+            if (!prompt && !titleRequest && messages.length) {
+              // a slice that renders empty is all echoes of replies the
+              // session already holds: start over with the whole story
+              deepseekSession = null
+              parentMessageId = null
+              from = 0
+              prompt = messagesToPrompt(messages, 0, { tools })
+            }
             if (!titleRequest && deepseekSession === null) sessions.delete(sessionKey)
 
             let last = null
@@ -256,7 +281,7 @@ export const server = async (_input, _options) => {
                         const used = step.value
                         usedSession = used?.sessionId ?? null
                         if (used?.sessionId && !titleRequest) {
-                          sessions.set(sessionKey, { sessionId: used.sessionId, messageId: used.messageId, count: messages.length, at: Date.now() })
+                          sessions.set(sessionKey, { sessionId: used.sessionId, messageId: used.messageId, anchor: messageSignature(messages[messages.length - 1]), at: Date.now() })
                         }
                         break
                       }

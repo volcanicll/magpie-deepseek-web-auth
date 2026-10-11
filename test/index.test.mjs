@@ -969,3 +969,102 @@ test("history shows the model its own calls and their results", () => {
   expect(prompt).toContain("User: and tomorrow?")
   expect(prompt).toContain("[Tool calling]")
 })
+
+// ---------------------------------------------------------------------------
+// session continuity with tool loops: the continuation anchor is the last
+// message of the previous request, so a history that grew (the tool loop) or
+// shrank (the agent pruning its context) keeps its DeepSeek chat, and the
+// tool result actually reaches the prompt.
+// ---------------------------------------------------------------------------
+
+test("a tool loop keeps one chat: call, result, answer, next turn", async () => {
+  const f = await fake({ reply: "done" })
+  const hooks = await server({}, { origin: f.origin })
+  const options = await hooks.auth.loader(async () => ({ type: "api", key: "a-token" }))
+  const call = (messages, extra = {}) =>
+    options.fetch(new Request(`${options.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-magpie-session": "sess-loop", ...extra },
+      body: JSON.stringify({ model: "deepseek-chat", stream: true, tools: [weatherTool], messages }),
+    })).then((r) => r.text())
+  const echo = (id, name, args) => [{ id, type: "function", function: { name, arguments: args } }]
+  await call([
+    { role: "system", content: "be brief" },
+    { role: "user", content: "weather?" },
+  ])
+  await call([
+    { role: "system", content: "be brief" },
+    { role: "user", content: "weather?" },
+    { role: "assistant", tool_calls: echo("call_1", "get_weather", '{"city":"北京"}') },
+    { role: "tool", tool_call_id: "call_1", content: "sunny 25C" },
+  ])
+  await call([
+    { role: "system", content: "be brief" },
+    { role: "user", content: "weather?" },
+    { role: "assistant", tool_calls: echo("call_1", "get_weather", '{"city":"北京"}') },
+    { role: "tool", tool_call_id: "call_1", content: "sunny 25C" },
+    { role: "assistant", content: "done" },
+    { role: "user", content: "and tomorrow?" },
+  ])
+  // one chat for the whole loop
+  expect(f.seen.sessions).toEqual(["session-1"])
+  const completions = f.seen.completions.filter((c) => c.path === "/api/v0/chat/completion")
+  expect(completions.length).toBe(3)
+  // the tool round's prompt carries the result — the model's own call echo is
+  // skipped, the client's result never is
+  expect(completions[1].payload.prompt).toContain("Tool result (get_weather): sunny 25C")
+  expect(completions[1].payload.chat_session_id).toBe("session-1")
+  expect(completions[1].payload.parent_message_id).toBe(2)
+  // the turn after the answer sends only the next user question
+  expect(completions[2].payload.prompt).toContain("and tomorrow?")
+  expect(completions[2].payload.chat_session_id).toBe("session-1")
+})
+
+test("a history the agent pruned still continues its chat when the anchor survives", async () => {
+  const f = await fake({ reply: "answer" })
+  const hooks = await server({}, { origin: f.origin })
+  const options = await hooks.auth.loader(async () => ({ type: "api", key: "a-token" }))
+  const call = (messages) =>
+    options.fetch(new Request(`${options.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-magpie-session": "sess-prune" },
+      body: JSON.stringify({ model: "deepseek-chat", stream: true, messages }),
+    })).then((r) => r.text())
+  await call([{ role: "system", content: "be brief" }, { role: "user", content: "first question" }])
+  // the agent pruned the system message away, keeping the anchored turn
+  await call([{ role: "user", content: "first question" }, { role: "user", content: "second question" }])
+  expect(f.seen.sessions).toEqual(["session-1"])
+  const completions = f.seen.completions.filter((c) => c.path === "/api/v0/chat/completion")
+  expect(completions[1].payload.chat_session_id).toBe("session-1")
+  expect(completions[1].payload.prompt).toBe("second question")
+})
+
+test("a rewritten history starts a fresh chat, and an identical resend does too", async () => {
+  const f = await fake({ reply: "answer" })
+  const hooks = await server({}, { origin: f.origin })
+  const options = await hooks.auth.loader(async () => ({ type: "api", key: "a-token" }))
+  const call = (messages) =>
+    options.fetch(new Request(`${options.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-magpie-session": "sess-rewrite" },
+      body: JSON.stringify({ model: "deepseek-chat", stream: true, messages }),
+    })).then((r) => r.text())
+  await call([{ role: "user", content: "first question" }])
+  // the anchor is gone: the conversation starts over, labelled
+  await call([{ role: "user", content: "a different question entirely" }])
+  // identical resend: nothing new after the anchor, so a fresh chat again
+  await call([{ role: "user", content: "a different question entirely" }])
+  expect(f.seen.sessions).toEqual(["session-1", "session-2", "session-3"])
+  const completions = f.seen.completions.filter((c) => c.path === "/api/v0/chat/completion")
+  expect(completions[1].payload.prompt).toBe("a different question entirely")
+  expect(completions[2].payload.prompt).toBe("a different question entirely")
+})
+
+test("messageSignature is stable across an identical resend and ties tool results to their calls", () => {
+  const { messageSignature } = _internal
+  const message = { role: "assistant", tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"北京"}' } }] }
+  expect(messageSignature(message)).toBe(messageSignature(JSON.parse(JSON.stringify(message))))
+  // a tool message's signature carries its id: results pair with their calls
+  const tool = { role: "tool", tool_call_id: "call_1", content: "sunny" }
+  expect(messageSignature(tool)).not.toBe(messageSignature({ role: "tool", tool_call_id: "call_2", content: "sunny" }))
+})

@@ -36,6 +36,22 @@ function finishReason(status) {
   }
 }
 
+// messageSignature is one message's identity, as the continuation anchor: the
+// agent may rewrite its history between requests (compaction, pruned tool
+// results), so where the conversation continues is found by locating the last
+// message the previous request ended with, not by counting.
+function messageSignature(message) {
+  const content = typeof message?.content === "string"
+    ? message.content
+    : Array.isArray(message?.content)
+      ? JSON.stringify(message.content)
+      : ""
+  const calls = Array.isArray(message?.tool_calls)
+    ? message.tool_calls.map((call) => `${call?.id ?? ""}:${call?.function?.name ?? ""}:${call?.function?.arguments ?? ""}`).join("|")
+    : ""
+  return JSON.stringify([message?.role ?? "", content, calls, message?.tool_call_id ?? ""])
+}
+
 // messagesToPrompt flattens OpenAI messages into DeepSeek's single prompt, as
 // the web page's one text box holds a conversation. With `from`, the turns
 // before it are left out: the web app's session remembers what it has said, so
@@ -52,12 +68,18 @@ function messagesToPrompt(messages, from = 0, { tools } = {}) {
   let spoke = false
   const toolNames = new Map() // tool_call_id → the name the client called
   const list = messages ?? []
+  for (const message of list) {
+    const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : []
+    for (const call of calls) {
+      if (typeof call?.id === "string" && typeof call?.function?.name === "string") toolNames.set(call.id, call.function.name)
+    }
+  }
   let index = Math.max(0, from)
-  // The agent's history re-sends its own last reply before the new user turn —
-  // an assistant message DeepSeek's session already holds — so leading
-  // assistant or tool messages at `from` are skipped: what is left is the turn
-  // the session has not seen.
-  while (index < list.length && (list[index]?.role === "assistant" || list[index]?.role === "tool")) index += 1
+  // The agent's history re-sends its own last reply before the new turn — an
+  // assistant message DeepSeek's session already holds — so leading assistant
+  // messages at `from` are skipped. Tool results are never skipped: whatever
+  // the client ran comes after the model called for it, and it is new.
+  while (index < list.length && list[index]?.role === "assistant") index += 1
   for (; index < list.length; index++) {
     const message = list[index]
     const role = message?.role
@@ -67,9 +89,6 @@ function messagesToPrompt(messages, from = 0, { tools } = {}) {
         ? message.content.map((part) => (typeof part === "string" ? part : part?.text ?? "")).join("")
         : ""
     const calls = role === "assistant" && Array.isArray(message?.tool_calls) ? message.tool_calls : []
-    for (const call of calls) {
-      if (typeof call?.id === "string" && typeof call?.function?.name === "string") toolNames.set(call.id, call.function.name)
-    }
     if (role === "system") {
       if (text) parts.push(text)
       continue
@@ -103,4 +122,4 @@ function messagesToPrompt(messages, from = 0, { tools } = {}) {
   return parts.join("\n\n")
 }
 
-export { encoder, chunk, finishReason, messagesToPrompt }
+export { encoder, chunk, finishReason, messagesToPrompt, messageSignature }

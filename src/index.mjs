@@ -45,7 +45,7 @@ import {
 } from "./browser-token.mjs"
 import { envelope } from "./api.mjs"
 import { PatchReader, iterSse } from "./stream.mjs"
-import { messagesToPrompt, finishReason } from "./openai.mjs"
+import { messagesToPrompt, messageSignature, finishReason } from "./openai.mjs"
 import { extractAttachments, decodeDataUrl } from "./attachments.mjs"
 import { toolsToPrompt, parseToolCall, renderToolCall } from "./toolcall.mjs"
 
@@ -59,6 +59,7 @@ export const _internal = {
   PatchReader,
   iterSse,
   messagesToPrompt,
+  messageSignature,
   extractAttachments,
   decodeDataUrl,
   toolsToPrompt,
